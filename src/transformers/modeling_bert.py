@@ -1201,18 +1201,36 @@ class BertForSequenceClassification(BertPreTrainedModel):
         logits = self.classifier(pooled_output)
 
         outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
-
-        if labels is not None:
-            if self.num_labels == 1:
-                #  We are doing regression
-                loss_fct = MSELoss()
-                loss = loss_fct(logits.view(-1), labels.view(-1))
-            else:
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            outputs = (loss,) + outputs
+        
+        
+        
+        ######################
+        sm = torch.nn.Softmax(dim=1)
+        after_sm = sm(logits)
+        
+        
+        loss = torch.mean(
+            -(1-labels)*torch.log(after_sm[:,0]+1e-10)
+            -(labels)*torch.log(after_sm[:,1]+1e-10)
+        
+        )
+        outputs = (loss,) + outputs
 
         return outputs  # (loss), logits, (hidden_states), (attentions)
+        
+        
+        ##########################
+#         if labels is not None:
+#             if self.num_labels == 1:
+#                 #  We are doing regression
+#                 loss_fct = MSELoss()
+#                 loss = loss_fct(logits.view(-1), labels.view(-1))
+#             else:
+#                 loss_fct = CrossEntropyLoss()
+#                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+#             outputs = (loss,) + outputs
+
+#         return outputs  # (loss), logits, (hidden_states), (attentions)
 
 
 
