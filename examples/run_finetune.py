@@ -776,7 +776,8 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
     all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
     if output_mode == "classification":
-        all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
+#         all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
+        all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
     elif output_mode == "regression":
         all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
 
@@ -1095,7 +1096,118 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+        
+        
+        ####################################
+        task=args.task_name
+        evaluate=False
+        
+        if args.local_rank not in [-1, 0] and not evaluate:
+            torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+
+        processor = processors[task]()
+        output_mode = output_modes[task]
+        # Load data features from cache or dataset file
+        cached_features_file = os.path.join(
+            args.data_dir,
+            "cached_{}_{}_{}_{}".format(
+                "dev" if evaluate else "train",
+                list(filter(None, args.model_name_or_path.split("/"))).pop(),
+                str(args.max_seq_length),
+                str(task),
+            ),
+        )
+        if args.do_predict:
+            cached_features_file = os.path.join(
+            args.data_dir,
+            "cached_{}_{}_{}".format(
+                "dev" if evaluate else "train",
+                str(args.max_seq_length),
+                str(task),
+            ),
+        )
+        if os.path.exists(cached_features_file) and not args.overwrite_cache:
+            logger.info("Loading features from cached file %s", cached_features_file)
+            features = torch.load(cached_features_file)
+        else:
+            logger.info("Creating features from dataset file at %s", args.data_dir)
+            label_list = processor.get_labels()
+            if task in ["mnli", "mnli-mm"] and args.model_type in ["roberta", "xlmroberta"]:
+                # HACK(label indices are swapped in RoBERTa pretrained model)
+                label_list[1], label_list[2] = label_list[2], label_list[1]
+            examples = (
+                processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+            )   
+
+
+            print("finish loading examples")
+
+            # params for convert_examples_to_features
+            max_length = args.max_seq_length
+            pad_on_left = bool(args.model_type in ["xlnet"])
+            pad_token = tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0]
+            pad_token_segment_id = 4 if args.model_type in ["xlnet"] else 0
+
+
+            if args.n_process == 1:
+                features = convert_examples_to_features(
+                examples,
+                tokenizer,
+                label_list=label_list,
+                max_length=max_length,
+                output_mode=output_mode,
+                pad_on_left=pad_on_left,  # pad on the left for xlnet
+                pad_token=pad_token,
+                pad_token_segment_id=pad_token_segment_id,)
+
+            else:
+                n_proc = int(args.n_process)
+                if evaluate:
+                    n_proc = max(int(n_proc/4),1)
+                print("number of processes for converting feature: " + str(n_proc))
+                p = Pool(n_proc)
+                indexes = [0]
+                len_slice = int(len(examples)/n_proc)
+                for i in range(1, n_proc+1):
+                    if i != n_proc:
+                        indexes.append(len_slice*(i))
+                    else:
+                        indexes.append(len(examples))
+
+                results = []
+
+                for i in range(n_proc):
+                    results.append(p.apply_async(convert_examples_to_features, args=(examples[indexes[i]:indexes[i+1]], tokenizer, max_length, None, label_list, output_mode, pad_on_left, pad_token, pad_token_segment_id, True,  )))
+                    print(str(i+1) + ' processor started !')
+
+                p.close()
+                p.join()
+
+                features = []
+                for result in results:
+                    features.extend(result.get())
+
+
+            if args.local_rank in [-1, 0]:
+                logger.info("Saving features into cached file %s", cached_features_file)
+                torch.save(features, cached_features_file)
+
+        if args.local_rank == 0 and not evaluate:
+            torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+
+        # Convert to Tensors and build dataset
+        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
+        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
+        if output_mode == "classification":
+    #         all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
+            all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
+        elif output_mode == "regression":
+            all_labels = torch.tensor([f.label for f in features], dtype=torch.float)
+
+        train_dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
+        
+        
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
